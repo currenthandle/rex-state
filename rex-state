@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Save / restore all Rex sessions, tabs, panes (layout + cwd) and the agent session in each pane.
+
+  rex-state save    [file]   # default ~/.rex-state.json (previous copy kept as .bak)
+  rex-state restore [file]   # recreate everything; agents resume via `claude --resume <id>` / `codex resume <id>`
+  rex-state show    [file]   # print what would be restored
+"""
+import glob, json, os, re, shlex, subprocess, sys
+
+DEFAULT = os.path.expanduser("~/.rex-state.json")
+TERM = "com.superlogical.terminal"
+
+
+def rex(*args):
+    return json.loads(subprocess.run(["rex", *args], check=True, capture_output=True, text=True).stdout or "null")
+
+
+def api(session, method, params):
+    return rex("api", "call", "-s", session, method, json.dumps(params))
+
+
+def agent_cmd(pid):
+    """Return the command that resumes the agent running as `pid`, or None."""
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout.split()
+    except Exception:
+        return None
+    if not args:
+        return None
+    exe = os.path.basename(args[0])
+    if exe == "claude" or "/claude/versions/" in args[0]:
+        f = os.path.expanduser(f"~/.claude/sessions/{pid}.json")  # Claude Code writes the live session id here
+        if not os.path.exists(f):
+            return None
+        sid = json.load(open(f))["sessionId"]
+        # shortcut: ps output isn't quoted, so flags with spaced values or a positional prompt get mangled; fine for plain flags
+        keep, skip = [], False
+        for a in args[1:]:
+            if skip:
+                skip = False
+            elif a in ("--resume", "-r", "--session-id"):
+                skip = True
+            elif a in ("--continue", "-c") or a.startswith(("--resume=", "--session-id=")):
+                pass
+            else:
+                keep.append(a)
+        return shlex.join(["claude", *keep, "--resume", sid])
+    if exe == "codex":
+        # codex keeps its rollout file open; the session uuid ends its name
+        out = subprocess.run(["lsof", "-p", str(pid), "-Fn"], capture_output=True, text=True).stdout
+        m = re.search(r"rollout-[^\n]*-([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl", out)
+        return f"codex resume {m.group(1)}" if m else None
+    return None
+
+
+def pane_spec(session, blk):
+    spec = {"flavor": blk["flavor"], "label": blk.get("label", "")}
+    if blk.get("creator_name") != TERM:
+        return spec
+    try:
+        p = rex("block", "call", "-s", session, "-b", blk["block_id"], "process")
+    except subprocess.CalledProcessError:
+        return spec
+    fg = p.get("foreground") or {}
+    shell = (p.get("ancestors") or [{}])[0]
+    opts = {"cwd": fg.get("cwd") or shell.get("cwd") or ""}
+    cmd = agent_cmd(fg["pid"]) if fg.get("pid") else None
+    if cmd:
+        spec["agent"] = cmd
+        opts["initial_input"] = cmd + "\n"  # typed into a normal shell, so the pane survives the agent exiting
+    elif fg.get("pid") and fg.get("pid") != shell.get("pid"):
+        # other foreground program: type it but don't press enter (re-running arbitrary commands is unsafe)
+        line = subprocess.run(["ps", "-o", "args=", "-p", str(fg["pid"])], capture_output=True, text=True).stdout.strip()
+        if line:
+            opts["initial_input"] = line
+    spec["options"] = opts
+    return spec
+
+
+def convert(node, blocks, session, order):
+    """Turn a session.view layout node into a new_window layout, recording old block ids in creation order."""
+    if "split" in node:
+        s = node["split"]
+        return {"split": {"direction": s["direction"], "ratio": s.get("ratio", 0.5),
+                          "before": convert(s["before"], blocks, session, order),
+                          "after": convert(s["after"], blocks, session, order)}}
+    order.append(node["block_id"])
+    return {"block": pane_spec(session, blocks[node["block_id"]])}
+
+
+def save(path):
+    state = []
+    for s in rex("ls", "--json")["sessions"]:
+        sid = s["session_id"]
+        view = rex("session", "inspect", sid, "--json")
+        wins = []
+        for w in view["windows"]:
+            layers = []
+            for layer in w["layers"]:
+                if not layer.get("layout"):
+                    continue
+                blocks = {b["block_id"]: b for b in layer["blocks"]}
+                order = []
+                layout = convert(layer["layout"], blocks, sid, order)
+                layers.append({"kind": layer["kind"], "bounds": layer["bounds"], "layout": layout,
+                               "focused": order.index(w["focused_block_id"]) if w.get("focused_block_id") in order else None,
+                               "zoomed": order.index(w["zoomed_block_id"]) if w.get("zoomed_block_id") in order else None})
+            wins.append({"label": w["label"], "active": w["window_id"] == view.get("active_window_id"), "layers": layers})
+        state.append({"label": s["label"], "windows": wins})
+    if os.path.exists(path):
+        os.replace(path, path + ".bak")
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+    n = sum(1 for _ in walk(state))
+    a = sum(1 for b in walk(state) if b.get("agent"))
+    print(f"saved {len(state)} sessions, {sum(len(s['windows']) for s in state)} tabs, {n} panes ({a} agents) -> {path}")
+
+
+def walk(state):
+    for s in state:
+        for w in s["windows"]:
+            for l in w["layers"]:
+                yield from leaves(l["layout"])
+
+
+def leaves(node):
+    if "split" in node:
+        yield from leaves(node["split"]["before"])
+        yield from leaves(node["split"]["after"])
+    else:
+        yield node["block"]
+
+
+def strip(node):
+    """Remove our private keys before sending a layout to Rex."""
+    if "split" in node:
+        return {"split": {**node["split"], "before": strip(node["split"]["before"]), "after": strip(node["split"]["after"])}}
+    b = {k: v for k, v in node["block"].items() if k != "agent"}
+    return {"block": b}
+
+
+def restore(path):
+    state = json.load(open(path))
+    for s in state:
+        sid = rex("new", s["label"], "--json")["session_id"]
+        placeholder = rex("session", "inspect", sid, "--json")["windows"][0]["window_id"]
+        active, focus, zoom = None, [], []
+        for w in s["windows"]:
+            wid = None
+            for l in w["layers"]:
+                if l["kind"] == "tiled" and wid is None:
+                    r = api(sid, "session.new_window", {"window_label": w["label"], "layout": strip(l["layout"]), "focus": False})
+                    wid = r["window_id"]
+                else:  # floating layer (or a tab with no tiled layer)
+                    if wid is None:
+                        continue
+                    r = api(sid, "session.new_layer", {"window_id": wid, "bounds": l["bounds"], "layout": strip(l["layout"])})
+                if l["focused"] is not None:
+                    focus.append(r["block_ids"][l["focused"]])
+                if l.get("zoomed") is not None:
+                    zoom.append(r["block_ids"][l["zoomed"]])
+            if w["active"]:
+                active = wid
+        api(sid, "session.close_window", {"window_id": placeholder})  # the empty tab `rex new` makes
+        for b in focus:
+            api(sid, "session.focus_block", {"block_id": b})
+        for b in zoom:
+            api(sid, "session.zoom_block", {"block_id": b, "zoom": True})
+        if active:
+            api(sid, "session.focus_window", {"window_id": active})
+        print(f"restored {s['label']}: {len(s['windows'])} tabs")
+
+
+def show(path):
+    for s in json.load(open(path)):
+        print(f"session {s['label']}")
+        for w in s["windows"]:
+            print(f"  tab {w['label']}{' (active)' if w['active'] else ''}")
+            for l in w["layers"]:
+                for b in leaves(l["layout"]):
+                    print(f"    {b.get('options', {}).get('cwd', '')}  {b.get('agent') or ''}")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT
+    {"save": save, "restore": restore, "show": show}.get(cmd, lambda _: sys.exit(__doc__))(path)
