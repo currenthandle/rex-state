@@ -53,6 +53,11 @@ def agent_cmd(pid):
     return None
 
 
+def idle(p):
+    """True when the pane's shell is at its prompt: the foreground process's only ancestor is the pane's launcher."""
+    return [a.get("pid") for a in p.get("ancestors") or []] == [(p.get("child") or {}).get("pid")]
+
+
 def pane_spec(session, blk):
     spec = {"flavor": blk["flavor"], "label": blk.get("label", "")}
     if blk.get("creator_name") != TERM:
@@ -62,13 +67,12 @@ def pane_spec(session, blk):
     except subprocess.CalledProcessError:
         return spec
     fg = p.get("foreground") or {}
-    shell = (p.get("ancestors") or [{}])[0]
-    opts = {"cwd": fg.get("cwd") or shell.get("cwd") or ""}
+    opts = {"cwd": fg.get("cwd") or ""}
     cmd = agent_cmd(fg["pid"]) if fg.get("pid") else None
     if cmd:
         spec["agent"] = cmd
         opts["initial_input"] = cmd + "\n"  # typed into a normal shell, so the pane survives the agent exiting
-    elif fg.get("pid") and fg.get("pid") != shell.get("pid"):
+    elif fg.get("pid") and not idle(p):
         # other foreground program: type it but don't press enter (re-running arbitrary commands is unsafe)
         line = subprocess.run(["ps", "-o", "args=", "-p", str(fg["pid"])], capture_output=True, text=True).stdout.strip()
         if line:
@@ -139,9 +143,52 @@ def strip(node):
     return {"block": b}
 
 
+def view_ids(node):
+    if "split" in node:
+        return view_ids(node["split"]["before"]) + view_ids(node["split"]["after"])
+    return [node["block_id"]]
+
+
+def shape(windows, saved):
+    """Pane-count signature per tab, from a live view (saved=False) or a saved state (saved=True)."""
+    if saved:
+        return [[len(list(leaves(l["layout"]))) for l in w["layers"]] for w in windows]
+    return [[len(view_ids(l["layout"])) for l in w["layers"] if l.get("layout")] for w in windows]
+
+
+def resume_in_place(sid, view, s):
+    """Rex already rebuilt this session's layout after the reboot: type each agent command into its pane."""
+    n = 0
+    for w, sw in zip(view["windows"], s["windows"]):
+        for l, sl in zip([l for l in w["layers"] if l.get("layout")], sw["layers"]):
+            for bid, spec in zip(view_ids(l["layout"]), leaves(sl["layout"])):
+                if not spec.get("agent"):
+                    continue
+                p = rex("block", "call", "-s", sid, "-b", bid, "process")
+                if not idle(p):
+                    continue  # something is already running there (e.g. this agent); don't type into it
+                subprocess.run(["rex", "send", "-s", sid, "-b", bid, spec["agent"]], check=True)
+                subprocess.run(["rex", "send-key", "-s", sid, "-b", bid, "enter"], check=True)
+                n += 1
+    print(f"resumed {n} agents in existing session {s['label']}")
+
+
 def restore(path):
     state = json.load(open(path))
+    live = {}
+    for x in rex("ls", "--json")["sessions"]:
+        live.setdefault(x["label"], []).append(x["session_id"])
     for s in state:
+        match = None
+        for cand in live.get(s["label"], []):
+            v = rex("session", "inspect", cand, "--json")
+            if shape(v["windows"], False) == shape(s["windows"], True):
+                match = (cand, v)
+                live[s["label"]].remove(cand)
+                break
+        if match:
+            resume_in_place(*match, s)
+            continue
         sid = rex("new", s["label"], "--json")["session_id"]
         placeholder = rex("session", "inspect", sid, "--json")["windows"][0]["window_id"]
         active, focus, zoom = None, [], []
