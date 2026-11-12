@@ -184,4 +184,6 @@ def show(path):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT
+    if cmd in ("restore", "show") and not os.path.exists(path):
+        sys.exit(f"no saved state at {path}; run `rex-state save` first")
     {"save": save, "restore": restore, "show": show}.get(cmd, lambda _: sys.exit(__doc__))(path)
